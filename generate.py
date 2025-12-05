@@ -4,215 +4,233 @@ import argparse
 import os
 from PIL import Image
 import gradio as gr
+import time
 
-def load_model(model_path, device="cuda"):
-    """Load the trained model"""
-    print(f"Loading model from {model_path}")
-    
-    # Try to load the fine-tuned model, fall back to base model if not found
-    try:
-        pipe = StableDiffusionPipeline.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            safety_checker=None
-        )
-    except:
-        print(f"Could not load model from {model_path}, using base model")
-        pipe = StableDiffusionPipeline.from_pretrained(
-            "runwayml/stable-diffusion-v1-5",
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            safety_checker=None
-        )
-    
-    # Use Euler Ancestral scheduler for better results
-    pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
-    
-    # Enable memory efficient attention if available
-    if torch.cuda.is_available():
-        pipe = pipe.to(device)
+class StableDiffusionGenerator:
+    def __init__(self, model_path, device="cuda"):
+        self.device = device if torch.cuda.is_available() else "cpu"
+        print(f"🚀 Loading model from {model_path}")
+        
+        # Check if model exists
+        if not os.path.exists(model_path):
+            print(f"⚠️ Model not found at {model_path}, using base model")
+            model_path = "runwayml/stable-diffusion-v1-5"
+        
+        # Load pipeline
         try:
-            pipe.enable_xformers_memory_efficient_attention()
+            self.pipe = StableDiffusionPipeline.from_pretrained(
+                model_path,
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                safety_checker=None,
+                requires_safety_checker=False
+            ).to(self.device)
         except:
-            print("Xformers not available, continuing without it")
-    
-    # Enable CPU offload for lower VRAM usage
-    try:
-        pipe.enable_model_cpu_offload()
-    except:
-        pass
-    
-    return pipe
-
-def generate_image(pipe, prompt, negative_prompt="", num_images=1, 
-                   num_inference_steps=30, guidance_scale=7.5, height=512, width=512, seed=None):
-    """Generate images from prompt"""
-    
-    if seed is not None:
-        generator = torch.Generator(device=pipe.device).manual_seed(seed)
-    else:
-        generator = None
-    
-    with torch.autocast("cuda") if torch.cuda.is_available() else torch.cpu.amp.autocast():
-        images = pipe(
-            prompt=[prompt] * num_images,
-            negative_prompt=[negative_prompt] * num_images if negative_prompt else None,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            height=height,
-            width=width,
-            generator=generator
-        ).images
-    
-    return images
-
-def save_images(images, prompt, output_dir="./generated_images"):
-    """Save generated images with prompt in filename"""
-    os.makedirs(output_dir, exist_ok=True)
-    
-    saved_paths = []
-    for i, img in enumerate(images):
-        # Clean prompt for filename
-        clean_prompt = prompt[:50].replace(" ", "_").replace("/", "_").replace("\\", "_")
-        filename = f"{clean_prompt}_{i}_{torch.randint(0, 10000, (1,)).item()}.png"
-        filepath = os.path.join(output_dir, filename)
-        img.save(filepath)
-        saved_paths.append(filepath)
-        print(f"Saved image to {filepath}")
-    
-    return saved_paths
-
-def gradio_interface(pipe):
-    """Create Gradio interface for image generation"""
-    
-    def generate(prompt, negative_prompt, num_steps, guidance, seed, width, height):
-        if seed == -1:
-            seed = None
+            print("❌ Failed to load fine-tuned model, using base model")
+            self.pipe = StableDiffusionPipeline.from_pretrained(
+                "runwayml/stable-diffusion-v1-5",
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                safety_checker=None,
+                requires_safety_checker=False
+            ).to(self.device)
         
-        images = generate_image(
-            pipe=pipe,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            num_images=1,
-            num_inference_steps=num_steps,
-            guidance_scale=guidance,
-            height=height,
-            width=width,
-            seed=seed
+        # Optimize for speed
+        self.pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(self.pipe.scheduler.config)
+        
+        # Enable memory optimizations
+        if self.device == "cuda":
+            self.pipe.enable_attention_slicing()
+            self.pipe.enable_xformers_memory_efficient_attention()
+        
+        print("✅ Model loaded successfully!")
+    
+    def generate_image(self, prompt, negative_prompt="", steps=30, guidance=7.5, 
+                      width=512, height=512, seed=-1, num_images=1):
+        """Generate images with given parameters"""
+        
+        if seed == -1:
+            seed = int.from_bytes(os.urandom(4), "big")
+        
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        
+        # Generate
+        start_time = time.time()
+        with torch.autocast("cuda") if self.device == "cuda" else torch.cpu.amp.autocast():
+            images = self.pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt if negative_prompt else None,
+                num_inference_steps=steps,
+                guidance_scale=guidance,
+                width=width,
+                height=height,
+                generator=generator,
+                num_images_per_prompt=num_images
+            ).images
+        
+        gen_time = time.time() - start_time
+        
+        return images, seed, gen_time
+    
+    def save_images(self, images, prompt, output_dir="./generated"):
+        """Save generated images"""
+        os.makedirs(output_dir, exist_ok=True)
+        
+        saved_paths = []
+        timestamp = int(time.time())
+        
+        for i, img in enumerate(images):
+            # Clean filename
+            clean_prompt = "".join(c for c in prompt[:30] if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            filename = f"{clean_prompt}_{timestamp}_{i}.png"
+            filepath = os.path.join(output_dir, filename)
+            
+            img.save(filepath)
+            saved_paths.append(filepath)
+        
+        return saved_paths
+
+def create_interface(generator):
+    """Create Gradio interface"""
+    
+    def generate_ui(prompt, negative_prompt, steps, guidance, width, height, seed, num_images):
+        images, used_seed, gen_time = generator.generate_image(
+            prompt, negative_prompt, steps, guidance, width, height, seed, num_images
         )
         
-        return images[0]
+        # Save images
+        saved = generator.save_images(images, prompt)
+        
+        # Prepare output
+        output_images = images if len(images) > 1 else images[0]
+        
+        info = f"✅ Generated {len(images)} image(s) in {gen_time:.2f}s\n"
+        info += f"📝 Prompt: {prompt}\n"
+        info += f"🎲 Seed: {used_seed}\n"
+        info += f"💾 Saved to: {os.path.dirname(saved[0])}"
+        
+        return output_images, info
     
-    with gr.Blocks(title="Stable Diffusion Image Generator") as demo:
+    # Interface
+    with gr.Blocks(title="Stable Diffusion Generator", theme=gr.themes.Soft()) as demo:
         gr.Markdown("# 🎨 Stable Diffusion Image Generator")
-        gr.Markdown("Generate images using your fine-tuned Stable Diffusion model")
+        gr.Markdown("Generate images using your fine-tuned model")
         
         with gr.Row():
-            with gr.Column():
+            with gr.Column(scale=1):
                 prompt = gr.Textbox(
                     label="Prompt",
-                    placeholder="Describe the image you want to generate...",
+                    placeholder="Describe your image...",
                     lines=3
                 )
                 negative_prompt = gr.Textbox(
                     label="Negative Prompt",
-                    placeholder="What you don't want in the image...",
+                    placeholder="What to exclude...",
                     lines=2
                 )
                 
                 with gr.Row():
-                    num_steps = gr.Slider(10, 100, value=30, step=1, label="Inference Steps")
-                    guidance = gr.Slider(1.0, 20.0, value=7.5, step=0.5, label="Guidance Scale")
+                    steps = gr.Slider(10, 50, value=25, step=1, label="Steps")
+                    guidance = gr.Slider(1, 20, value=7.5, step=0.5, label="Guidance Scale")
                 
                 with gr.Row():
                     width = gr.Slider(256, 1024, value=512, step=64, label="Width")
                     height = gr.Slider(256, 1024, value=512, step=64, label="Height")
                 
-                seed = gr.Number(value=-1, label="Seed (-1 for random)")
+                with gr.Row():
+                    seed = gr.Number(value=-1, label="Seed (-1 for random)")
+                    num_images = gr.Slider(1, 4, value=1, step=1, label="Number of Images")
                 
-                generate_btn = gr.Button("Generate Image", variant="primary")
+                generate_btn = gr.Button("✨ Generate", variant="primary", size="lg")
             
-            with gr.Column():
-                output_image = gr.Image(label="Generated Image")
-        
-        generate_btn.click(
-            generate,
-            inputs=[prompt, negative_prompt, num_steps, guidance, seed, width, height],
-            outputs=[output_image]
-        )
+            with gr.Column(scale=2):
+                output_image = gr.Gallery(label="Generated Images", columns=2, height=600)
+                info_box = gr.Textbox(label="Generation Info", lines=4)
         
         # Examples
-        gr.Examples(
-            examples=[
-                ["a beautiful sunset over mountains, digital art"],
-                ["a cute cat wearing a hat, cartoon style"],
-                ["futuristic cityscape at night, neon lights, cyberpunk"],
-                ["portrait of an ancient warrior, detailed armor, realistic"],
-            ],
-            inputs=[prompt]
+        examples = [
+            ["a beautiful landscape with mountains and lake, digital art, 4k"],
+            ["portrait of a cyberpunk character, neon lights, detailed face"],
+            ["cute anime character, pastel colors, studio ghibli style"],
+            ["futuristic city at night, flying cars, cyberpunk aesthetic"],
+        ]
+        
+        gr.Examples(examples=examples, inputs=[prompt])
+        
+        # Generate button
+        generate_btn.click(
+            fn=generate_ui,
+            inputs=[prompt, negative_prompt, steps, guidance, width, height, seed, num_images],
+            outputs=[output_image, info_box]
         )
     
     return demo
 
 def main():
     parser = argparse.ArgumentParser(description="Generate images with Stable Diffusion")
+    
     parser.add_argument("--model_path", type=str, default="./sd-finetuned",
-                       help="Path to the trained model")
+                       help="Path to trained model")
     parser.add_argument("--prompt", type=str, default="",
-                       help="Prompt for image generation")
-    parser.add_argument("--negative_prompt", type=str, default="",
+                       help="Prompt for generation (command line mode)")
+    parser.add_argument("--negative", type=str, default="",
                        help="Negative prompt")
-    parser.add_argument("--num_images", type=int, default=1,
-                       help="Number of images to generate")
-    parser.add_argument("--num_steps", type=int, default=30,
+    parser.add_argument("--steps", type=int, default=25,
                        help="Number of inference steps")
-    parser.add_argument("--guidance_scale", type=float, default=7.5,
+    parser.add_argument("--guidance", type=float, default=7.5,
                        help="Guidance scale")
-    parser.add_argument("--height", type=int, default=512,
-                       help="Image height")
     parser.add_argument("--width", type=int, default=512,
                        help="Image width")
-    parser.add_argument("--seed", type=int, default=None,
+    parser.add_argument("--height", type=int, default=512,
+                       help="Image height")
+    parser.add_argument("--seed", type=int, default=-1,
                        help="Random seed")
-    parser.add_argument("--output_dir", type=str, default="./generated_images",
-                       help="Directory to save generated images")
-    parser.add_argument("--gradio", action="store_true",
-                       help="Launch Gradio web interface")
+    parser.add_argument("--num", type=int, default=1,
+                       help="Number of images")
+    parser.add_argument("--output", type=str, default="./generated",
+                       help="Output directory")
+    parser.add_argument("--ui", action="store_true",
+                       help="Launch web UI")
     
     args = parser.parse_args()
     
-    # Set device
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    # Initialize generator
+    generator = StableDiffusionGenerator(args.model_path)
     
-    # Load model
-    pipe = load_model(args.model_path, device)
-    
-    if args.gradio:
-        # Launch Gradio interface
-        demo = gradio_interface(pipe)
-        demo.launch(share=True, server_name="0.0.0.0", server_port=7860)
+    if args.ui:
+        # Launch web interface
+        print("🌐 Launching web interface...")
+        print("   Open http://localhost:7860 in your browser")
+        demo = create_interface(generator)
+        demo.launch(share=False, server_name="0.0.0.0", server_port=7860)
     else:
-        # Generate from command line arguments
-        if args.prompt:
-            images = generate_image(
-                pipe=pipe,
-                prompt=args.prompt,
-                negative_prompt=args.negative_prompt,
-                num_images=args.num_images,
-                num_inference_steps=args.num_steps,
-                guidance_scale=args.guidance_scale,
-                height=args.height,
-                width=args.width,
-                seed=args.seed
-            )
-            
-            saved_paths = save_images(images, args.prompt, args.output_dir)
-            
-            # Display first image
-            if images:
-                images[0].show()
-        else:
-            print("Please provide a prompt using --prompt or use --gradio for web interface")
+        # Command line mode
+        if not args.prompt:
+            print("❌ Please provide a prompt with --prompt or use --ui for web interface")
+            return
+        
+        print(f"🎨 Generating: {args.prompt}")
+        
+        images, seed, gen_time = generator.generate_image(
+            prompt=args.prompt,
+            negative_prompt=args.negative,
+            steps=args.steps,
+            guidance=args.guidance,
+            width=args.width,
+            height=args.height,
+            seed=args.seed,
+            num_images=args.num
+        )
+        
+        saved = generator.save_images(images, args.prompt, args.output)
+        
+        print(f"✅ Generated {len(images)} image(s) in {gen_time:.2f}s")
+        print(f"🎲 Seed: {seed}")
+        print(f"💾 Saved to:")
+        for path in saved:
+            print(f"   {path}")
+        
+        # Show first image
+        if images:
+            images[0].show()
 
 if __name__ == "__main__":
     main()
